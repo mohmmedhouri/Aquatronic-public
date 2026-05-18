@@ -10,6 +10,7 @@
 
 close all;clc;clear;
 %% Simulation configuration
+addpath(genpath(pwd))
 
 % Simulation script for multi-ASV (surface vehicles) scenario.
 % All added comments are in English. Units: SI (meters [m], seconds [s],
@@ -24,7 +25,8 @@ close all;clc;clear;
 %   Edit those files (e.g., params inside) to change masses, inertia, geometry, actuator limits, etc.
 % - Currents, wind and noise settings are controlled below (this script).
 % - Control sample time T_s sets controller update frequency (seconds).
-
+addpath('C:\Users\mhdho\Downloads\casadi-3.6.4-windows64-matlab2018b')
+import casadi.* 
 % 1. Simulation
 no_vessels = 2;         % number of vessels to simulate [dimensionless]
 Tsim = 100;             % total simulation time [s]
@@ -36,17 +38,17 @@ tm = 0:T_s:Tsim;        % time vector (from 0 to Tsim with step T_s) [s]
 % Initialize vehicle objects/structs. See each init* function for fields and units.
 % Typical fields you will find there: mass [kg], Izz [kg*m^2], length [m], max_thrust [N], Cd [-], etc.
 vessel_ciber = initCybership();
-vessel_otter = initOtter();
+vessel_otter = initCybership();
 
 % 3. Disturbances
 % 3.1. Wind
-activate_wind = 1;      % flag: 1 -> enable currents, 0 -> disable (dimensionless)
+activate_wind = 0;      % flag: 1 -> enable currents, 0 -> disable (dimensionless)
 V_w = 2.5;              % wind speed [m/s]
 beta_w = pi/2;         % wind direction [rad] 
 wind = [activate_wind * V_w, beta_w];   % packaged wind vector: [speed, direction]
 
 % 4. Ocean Currents
-activate_currents = 1;  % flag: 1 -> enable currents, 0 -> disable (dimensionless)
+activate_currents = 0;  % flag: 1 -> enable currents, 0 -> disable (dimensionless)
 V_c = 0.5;           % current speed [m/s]
 beta_c = pi/2;         % current direction [rad] 
 ocean_currents = Currents(beta_c, V_c, activate_currents); % packaged current vector: [speed, direction, flag]
@@ -137,7 +139,7 @@ for i = 1:no_vessels
                 ASVs{i} = Cybership(vessel_ciber, X_0(1 + aux_skip_rows: no_items + aux_skip_rows), initObserver(0,T_s) ,wind);
             case 2
                 % Position (important initial states)
-                x0   = -2.535533906;   % initial x-position [m]
+                x0   = -4.535533906;   % initial x-position [m]
                 y0   = 2.535533906;    % initial y-position [m]
                 z0   = 0;              % surface level [m]
                 % Orientation
@@ -191,11 +193,10 @@ for i = 1:no_vessels
 
 end
 
-%% 
-
 
 t_s_mlc  = 0.4;                    % MPC Band sampling time [s]
 relacion_T = round(t_s_mlc/T_s);   % ratio between controller periods
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Creation of path following controllers vector (MPC) disturbances and definition of their parameters
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -209,20 +210,53 @@ paramsMPChldis.Nu    = diag([20,0,0]);     % Nu: control-reference tracking weig
 paramsMPChldis.t_sim = T_s;                % internal MPC simulation time [s]
 
 mMLCs_dis = cell(1,no_vessels);
+
 for i = 1:no_vessels
     switch i
-            case 1
-                paramsMPChldis.path = 1;
-                mMLCs_dis{i} = MpcPFDisController(vessel_ciber, paramsMPChldis, t_s_mlc); 
-            case 2
-                paramsMPChldis.path = 2;
-                mMLCs_dis{i} = MpcPFDisController(vessel_ciber, paramsMPChldis, t_s_mlc); 
+        case 1
+            paramsMPChldis.path = 1;
+            mMLCs_dis{i} = MpcPFDisController(vessel_ciber, paramsMPChldis, t_s_mlc); 
+        case 2
+            paramsMPChldis.path = 2;
+            mMLCs_dis{i} = MpcPFDisController(vessel_ciber, paramsMPChldis, t_s_mlc); 
     end
 end
 
+%% Fleet Controller using W / path variable
+
+fleet_controller = FleetController(no_vessels);
+
+% Your current paths are closed/concentric circles
+fleet_controller.closed_path = true;
+fleet_controller.w_period = 2*pi;
+
+% Same angular/path variable value
+fleet_controller.w_offset = [0; 0];
+
+% Nominal fleet speed.
+% Do NOT use fleet_controller.u_base here.
+% The FleetController computes u_base internally from path geometry f.
+fleet_controller.u_fleet = 1.0;
+
+% Speed limits compatible with MpcPFDisController
+fleet_controller.u_min = 0.4;
+fleet_controller.u_max = 1.8;
+
+% Synchronization gain for w error
+fleet_controller.k_w = 0.25;
+
+% Smoothing
+fleet_controller.alpha_u = 0.4;
+
+% Diagnostics
+hist_fleet_u_d = zeros(no_vessels, length(tm));
+hist_fleet_w = zeros(no_vessels, length(tm));
+hist_fleet_w_error = zeros(no_vessels, length(tm));
+hist_fleet_f = zeros(no_vessels, length(tm));
+hist_fleet_u_base = zeros(no_vessels, length(tm));
+
 % The equation for each path can be defined in the script Utils/pathScriptCasADI.m;
 % inside the if statement, each of the paths is defined.
-
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Creation and description of storage vectors
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -250,10 +284,21 @@ t1 = datetime('now');
 h = waitbar(0, 'Simulando...');     % Creation of progress bar
 record_mlc = relacion_T;            % Variable for sampling time synchronization
 for k=1:((Tsim-0)/T_s)
-    hist_X_hat(:, k) = get_estimations(ASVs);               % Storage of the estimates
-    % Obtain the w of each of the ASVs.
-    w1 = mMLCs_dis{1}.getCurrent_w();
-    w2 = mMLCs_dis{2}.getCurrent_w();
+ hist_X_hat(:, k) = get_estimations(ASVs);
+
+    % Fleet Controller: coordinate virtual target path variables w
+    fleet_ref = fleet_controller.step(mMLCs_dis);
+
+    % Store diagnostics
+    hist_fleet_u_d(:, k) = fleet_ref.u_d;
+    hist_fleet_w(:, k) = fleet_ref.w;
+    hist_fleet_w_error(:, k) = fleet_ref.w_error;
+    hist_fleet_f(:, k) = fleet_ref.f;
+    hist_fleet_u_base(:, k) = fleet_ref.u_base;
+
+    % Existing monitoring variables
+    w1 = fleet_ref.w(1);
+    w2 = fleet_ref.w(2);
 
     for v = 1:no_vessels
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -261,9 +306,13 @@ for k=1:((Tsim-0)/T_s)
         %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
         switch v
             case 1
-                ref = mMLCs_dis{v}.step(1.0, ASVs{v}.observer_obj.getEstimations(), disturbances_mod);
+                %ref = mMLCs_dis{v}.step(1.0, ASVs{v}.observer_obj.getEstimations(), disturbances_mod);
+                u_d_v = fleet_ref.u_d(v);
+                ref = mMLCs_dis{v}.step(u_d_v,ASVs{v}.observer_obj.getEstimations(),disturbances_mod);
             case 2
-                ref = mMLCs_dis{v}.step(1.0, ASVs{v}.observer_obj.getEstimations(), disturbances_mod);
+                %ref = mMLCs_dis{v}.step(1.0, ASVs{v}.observer_obj.getEstimations(), disturbances_mod);
+                u_d_v = fleet_ref.u_d(v);
+                ref = mMLCs_dis{v}.step(u_d_v,ASVs{v}.observer_obj.getEstimations(),disturbances_mod);
         end
 
         % 3) ASVs{v}.setTao([Fu; 0; Tr]);
@@ -342,5 +391,16 @@ Figure_mpc_hlc_dis(2, hist_X, hist_X_hat, hist_mpc_hlc_dis, tm, 0.0, mMLCs_dis{2
 %% Exercise animations by control type
 set(0,'DefaultFigureWindowStyle','normal')
 animateFleetMPCPFDis(hist_X, hist_mpc_hlc_dis, tm, ASVs, mMLCs_dis, no_items, disturbances_mod)
+videoFile = 'fleet_animation.mp4';
+
+animateFleetMPCPFDis( ...
+    hist_X, ...
+    hist_mpc_hlc_dis, ...
+    tm, ...
+    ASVs, ...
+    mMLCs_dis, ...
+    no_items, ...
+    disturbances_mod, ...
+    videoFile);
 % animateFleet(hist_X, tm, ASVs, no_items)
 % animateFleet3D(hist_X, tm, ASVs, no_items)

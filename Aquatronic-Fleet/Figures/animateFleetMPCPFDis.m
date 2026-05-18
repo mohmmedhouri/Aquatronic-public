@@ -11,7 +11,7 @@
 % into path-following performance.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-function animateFleetMPCPFDis(hist_X, hist_mlc, tm, m_asv, m_mlc, no_items, disturbances)
+function Video_animateFleetMPCPFDis(hist_X, hist_mlc, tm, m_asv, m_mlc, no_items, disturbances)
     no_vessels = length(m_asv);
 
     V_w = disturbances.V_w;
